@@ -16,10 +16,19 @@ import { run as mergeReferences } from "./scripts/merge-references.mjs";
 import { briefHasAllSections, briefHasReferences } from "./scripts/validate_pipeline.mjs";
 import { cleanUrl } from "./libs/url.mjs";
 import { sendBriefEmail } from "./libs/email/briefEmail.mjs";
+import { toPublicBrief, classifyPipelineError } from "./libs/briefs/serialize.mjs";
+import { webhookSignatureHeader } from "./libs/api-keys.mjs";
 
 const APP_ENV = process.env.APP_ENV || "DEVELOPMENT";
 const STALE_JOB_TIMEOUT_MS = 20 * 60 * 1000;
 const POLL_INTERVAL_MS = 5000;
+
+// Completion webhooks (agent-first API). One immediate attempt after the brief
+// completes; failures are retried by retryPendingWebhooks on the recovery
+// interval until delivered or WEBHOOK_MAX_ATTEMPTS is reached.
+const WEBHOOK_TIMEOUT_MS = 10_000;
+const WEBHOOK_MAX_ATTEMPTS = 8;
+const WEBHOOK_RETRY_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 function log(...args) {
@@ -78,11 +87,21 @@ app.get("/status", async (req, res) => {
 // Pipeline errors are fire-and-forget so they're caught in runPipeline's catch block instead.
 if (posthog) setupExpressErrorHandler(posthog, app);
 
-// Closes out a brief row regardless of outcome. Pass output_markdown + references on success;
-// omit them on failure — the row still flips to "complete" so the user isn't left hanging.
+// Closes out a brief row regardless of outcome. Pass outputMarkdown + references on
+// success; omit them on failure — the row still flips to "complete" so the user isn't
+// left hanging. `outcome`/`errorCode`/`errorMessage` are the agent-facing verdict
+// (see libs/briefs/serialize.mjs); `errorLog` remains developer-only.
 async function completeBrief(
   briefId,
-  { outputMarkdown = null, references = null, errorLog = null, completedAt = null } = {}
+  {
+    outputMarkdown = null,
+    references = null,
+    errorLog = null,
+    completedAt = null,
+    outcome = null,
+    errorCode = null,
+    errorMessage = null,
+  } = {}
 ) {
   const { error } = await supabase
     .from("briefs")
@@ -92,6 +111,9 @@ async function completeBrief(
       ...(outputMarkdown !== null && { output_markdown: outputMarkdown }),
       ...(references !== null && { references }),
       ...(errorLog !== null && { error_log: errorLog }),
+      ...(outcome !== null && { outcome }),
+      error_code: errorCode,
+      error_message: errorMessage,
     })
     .eq("id", briefId);
 
@@ -115,6 +137,129 @@ async function alertDeveloper({ briefId, jobId, error, episodeUrl, context }) {
       timestamp: new Date().toISOString(),
     }),
   }).catch((err) => logError(`[webhook error] ${err.message}`));
+}
+
+// Automatic refund for a brief that failed with no usable output. Only first
+// runs are refunded automatically: a failed regeneration may have been free
+// (24h window) while credits_charged still reflects the original run, so the
+// RPC could over-refund. Those go to the developer alert for manual handling.
+async function refundFailedBrief({ briefId, regenerationCount, episodeUrl, jobId }) {
+  if ((regenerationCount ?? 0) > 0) {
+    await alertDeveloper({
+      briefId,
+      jobId,
+      error: "Regeneration failed — check whether a manual refund is due",
+      episodeUrl,
+      context: { regenerationCount },
+    });
+    return;
+  }
+  const { data, error } = await supabase.rpc("refund_brief_credits", {
+    p_brief_id: briefId,
+    p_reason: "refund:brief_failure",
+  });
+  if (error) {
+    logError(`[refund] RPC failed for ${briefId}:`, error.message);
+    return;
+  }
+  if (data?.error && data.error !== "already_refunded") {
+    logError(`[refund] ${briefId}: ${data.error}`);
+    return;
+  }
+  log(`[refund] ${briefId}: refunded ${data?.credits_refunded ?? 0} credit(s)`);
+}
+
+// Delivers the brief.completed webhook for one brief. Re-reads the row so the
+// payload reflects the final state. Signed with the API key's callback_secret
+// when the brief was created by a key; unsigned otherwise (callback_url supplied
+// by a session caller). Returns true when the receiver answered 2xx.
+async function deliverBriefWebhook(briefId) {
+  const { data: brief, error } = await supabase.from("briefs").select("*").eq("id", briefId).single();
+  if (error || !brief) {
+    logError(`[webhook] could not load brief ${briefId}:`, error?.message);
+    return false;
+  }
+  if (!brief.callback_url || brief.webhook_delivered_at || brief.status !== "complete") return false;
+
+  let secret = null;
+  if (brief.api_key_id) {
+    const { data: key } = await supabase
+      .from("api_keys")
+      .select("callback_secret")
+      .eq("id", brief.api_key_id)
+      .maybeSingle();
+    secret = key?.callback_secret ?? null;
+  }
+
+  const payload = JSON.stringify({
+    id: `evt_${randomUUID()}`,
+    type: "brief.completed",
+    created_at: new Date().toISOString(),
+    data: toPublicBrief(brief),
+  });
+
+  const headers = {
+    "Content-Type": "application/json",
+    "User-Agent": "PodcastBrief-Webhooks/1.0",
+    "X-PodcastBrief-Event": "brief.completed",
+    "X-PodcastBrief-Brief-Id": brief.id,
+  };
+  if (secret) headers["X-PodcastBrief-Signature"] = webhookSignatureHeader(secret, payload);
+
+  let status = 0;
+  let ok = false;
+  try {
+    const res = await fetch(brief.callback_url, {
+      method: "POST",
+      headers,
+      body: payload,
+      redirect: "manual",
+      signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
+    });
+    status = res.status;
+    ok = res.ok;
+  } catch (err) {
+    logError(`[webhook] delivery to ${brief.callback_url} failed for ${brief.id}:`, err.message);
+  }
+
+  const now = new Date().toISOString();
+  const { error: updateError } = await supabase
+    .from("briefs")
+    .update({
+      webhook_attempts: (brief.webhook_attempts ?? 0) + 1,
+      webhook_last_status: status,
+      webhook_last_attempt_at: now,
+      ...(ok && { webhook_delivered_at: now }),
+    })
+    .eq("id", brief.id);
+  if (updateError) logError(`[webhook] failed to record attempt for ${brief.id}:`, updateError.message);
+
+  log(`[webhook] ${brief.id} → ${status} (${ok ? "delivered" : "will retry"})`);
+  return ok;
+}
+
+// Retries undelivered webhooks for briefs completed in the last 24h. Runs on the
+// recovery interval (5 min), so effective retry spacing is ~5 min × 8 attempts.
+async function retryPendingWebhooks() {
+  const since = new Date(Date.now() - WEBHOOK_RETRY_WINDOW_MS).toISOString();
+  const { data, error } = await supabase
+    .from("briefs")
+    .select("id")
+    .eq("environment", APP_ENV)
+    .eq("status", "complete")
+    .not("callback_url", "is", null)
+    .is("webhook_delivered_at", null)
+    .lt("webhook_attempts", WEBHOOK_MAX_ATTEMPTS)
+    .gt("completed_at", since)
+    .order("completed_at", { ascending: true })
+    .limit(20);
+  if (error) {
+    logError(`[webhook] retry scan failed: ${error.message}`);
+    return;
+  }
+  for (const row of data || []) {
+    await deliverBriefWebhook(row.id).catch((e) => logError(`[webhook] retry error for ${row.id}:`, e.message));
+  }
 }
 
 // Generates a brief and validates it, retrying once with a targeted prompt if sections or
@@ -143,9 +288,7 @@ async function generateBriefWithValidation({
   if (sectionsCheck.valid && refsCheck.valid) return { outputPath, outputMd };
 
   const reasons = [sectionsCheck, refsCheck].filter((c) => !c.valid).map((c) => c.reason);
-  const promptAddition = !refsCheck.valid
-    ? RETRY_PROMPTS.noReferences
-    : RETRY_PROMPTS.missingSections;
+  const promptAddition = !refsCheck.valid ? RETRY_PROMPTS.noReferences : RETRY_PROMPTS.missingSections;
   errorLog.push({ step: "validate-output", attempt: 1, reasons });
   logError(`[retry] Brief validation failed: ${reasons.join("; ")} — retrying generateBrief`);
 
@@ -180,6 +323,9 @@ async function runPipeline(episodeUrl, profileId, briefId) {
   const errorLog = [];
   const posthogCtx = { posthog, traceId, pipelineSpanId };
 
+  // Tracks which stage threw, so the catch block can emit a stable error_code.
+  let step = "transcribe";
+
   try {
     const { episodeId, transcriptPath, podcastName, episodeTitle } = await transcribe(episodeUrl, { outputDir: jobDir });
 
@@ -189,6 +335,7 @@ async function runPipeline(episodeUrl, profileId, briefId) {
       .eq("id", briefId);
     if (metaError) logError(`[metadata] Failed to save episode metadata for brief ${briefId}:`, metaError.message);
 
+    step = "generate";
     const { outputPath, outputMd } = await generateBriefWithValidation({
       transcriptId: episodeId,
       transcriptPath,
@@ -199,6 +346,7 @@ async function runPipeline(episodeUrl, profileId, briefId) {
       posthogCtx,
     });
 
+    step = "enrich";
     const { referencesJsonPath } = await enrichReferences(outputPath, {
       outputDir: jobDir,
       profileId,
@@ -209,9 +357,10 @@ async function runPipeline(episodeUrl, profileId, briefId) {
     let referencesJson = null;
 
     if (referencesJsonPath) {
-      const { referencesMdPath, referencesJson: validated } =
-        await validateReferences(referencesJsonPath);
+      step = "validate-references";
+      const { referencesMdPath, referencesJson: validated } = await validateReferences(referencesJsonPath);
       referencesJson = validated;
+      step = "merge";
       ({ finalBriefMd } = await mergeReferences({
         briefPath: outputPath,
         referencesPath: referencesMdPath,
@@ -219,12 +368,16 @@ async function runPipeline(episodeUrl, profileId, briefId) {
       }));
     }
 
+    step = "complete";
     const completedAt = new Date().toISOString();
+    // LLM validation retries (errorLog "validate-output" entries) do not change
+    // the outcome: the user got a full brief. They remain visible in error_log.
     await completeBrief(briefId, {
       outputMarkdown: finalBriefMd,
       references: referencesJson,
       errorLog: errorLog.length > 0 ? errorLog : null,
       completedAt,
+      outcome: "succeeded",
     });
 
     // Awaited but non-blocking — errors caught, don't crash pipeline
@@ -238,6 +391,8 @@ async function runPipeline(episodeUrl, profileId, briefId) {
         completedAt,
       }).catch((err) => logError(`[email] Failed to send brief email for ${briefId}:`, err.message));
     }
+
+    await deliverBriefWebhook(briefId).catch((e) => logError(`[webhook] ${briefId}:`, e.message));
 
     if (errorLog.length > 0) {
       await alertDeveloper({
@@ -270,27 +425,36 @@ async function runPipeline(episodeUrl, profileId, briefId) {
 
     log(`[pipeline] complete [job=${jobId}]${errorLog.length > 0 ? " (degraded)" : ""}`);
   } catch (err) {
-    logError(`[pipeline error] ${err.message}`);
-    errorLog.push({ step: "unrecoverable", error: err.message, stack: err.stack });
+    logError(`[pipeline error] step=${step} ${err.message}`);
+    errorLog.push({ step: "unrecoverable", failedStep: step, error: err.message, stack: err.stack });
     posthog?.captureException(err, profileId, {
       briefId,
       jobId,
       episodeUrl,
-      pipeline_step: errorLog[errorLog.length - 1]?.step ?? "unknown",
+      pipeline_step: step,
     });
 
-    const errorCompletedAt = new Date().toISOString();
-    await completeBrief(briefId, { errorLog, completedAt: errorCompletedAt }).catch((e) =>
-      logError("[cleanup] Failed to update brief status:", e.message)
-    );
-
-    // Still send the email if the brief has usable content (written mid-pipeline as crash insurance)
+    // Read what survived (output_markdown is written mid-pipeline as crash
+    // insurance) BEFORE closing the row, so the outcome can be decided in one write.
     const { data: partialBrief } = await supabase
       .from("briefs")
-      .select("output_markdown, podcast_name, episode_title")
+      .select("output_markdown, podcast_name, episode_title, regeneration_count")
       .eq("id", briefId)
       .single();
-    if (partialBrief?.output_markdown) {
+
+    const hasContent = Boolean(partialBrief?.output_markdown);
+    const classified = classifyPipelineError(step, err);
+    const errorCompletedAt = new Date().toISOString();
+
+    await completeBrief(briefId, {
+      errorLog,
+      completedAt: errorCompletedAt,
+      outcome: hasContent ? "partial" : "failed",
+      errorCode: classified.code,
+      errorMessage: classified.message,
+    }).catch((e) => logError("[cleanup] Failed to update brief status:", e.message));
+
+    if (hasContent) {
       await sendBriefEmail({
         briefId,
         profileId,
@@ -299,7 +463,16 @@ async function runPipeline(episodeUrl, profileId, briefId) {
         episodeTitle: partialBrief.episode_title,
         podcastName: partialBrief.podcast_name,
       }).catch((emailErr) => logError(`[email] Failed to send brief email for ${briefId}:`, emailErr.message));
+    } else {
+      await refundFailedBrief({
+        briefId,
+        regenerationCount: partialBrief?.regeneration_count ?? 0,
+        episodeUrl,
+        jobId,
+      }).catch((e) => logError(`[refund] ${briefId}:`, e.message));
     }
+
+    await deliverBriefWebhook(briefId).catch((e) => logError(`[webhook] ${briefId}:`, e.message));
 
     await alertDeveloper({ briefId, jobId, error: err.message, episodeUrl, context: errorLog });
   } finally {
@@ -384,7 +557,7 @@ function __setCurrentJobIdForTesting(id) {
   currentJobId = id;
 }
 
-// Run stale job recovery every 5 minutes — not just on boot.
+// Run stale job recovery (and webhook retries) every 5 minutes — not just on boot.
 // Railway blue-green deploys can kill the old container mid-pipeline, leaving
 // briefs stuck at "generating". The startup recovery misses them if they're
 // too fresh (<20min). Periodic recovery catches them on the next pass.
@@ -400,7 +573,9 @@ if (isMainModule) {
   app.listen(PORT, async () => {
     log(`Worker listening on port ${PORT} (env: ${APP_ENV})`);
     await recoverStaleJobs();
+    await retryPendingWebhooks();
     setInterval(recoverStaleJobs, RECOVERY_INTERVAL_MS);
+    setInterval(retryPendingWebhooks, RECOVERY_INTERVAL_MS);
     setInterval(pollForWork, POLL_INTERVAL_MS);
     pollForWork(); // check immediately on boot
   });
@@ -415,6 +590,8 @@ export {
   app,
   claimNextJob,
   recoverStaleJobs,
+  retryPendingWebhooks,
+  deliverBriefWebhook,
   pollForWork,
   runPipeline,
   STALE_JOB_TIMEOUT_MS,

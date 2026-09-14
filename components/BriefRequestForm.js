@@ -6,6 +6,7 @@ import apiClient from "@/libs/api";
 import { formatDuration } from "@/libs/credits";
 import CreditPackModal from "@/components/CreditPackModal";
 
+
 export default function BriefRequestForm({ onSuccess }) {
   const [url, setUrl] = useState("");
   const [estimateResult, setEstimateResult] = useState(null);

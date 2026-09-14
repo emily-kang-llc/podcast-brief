@@ -44,6 +44,8 @@ User checks dashboard / /billing for credit history
 
 Uses Supabase Auth with email OTP (magic links) + PKCE for secure code exchange.
 
+**What PKCE means:** PKCE (Proof Key for Code Exchange) makes the emailed authorization code insufficient on its own. When the magic link is requested, the browser creates a random private `code_verifier`, stores it in a cookie, and sends Supabase only a derived `code_challenge`. When the link returns with an authorization code, the browser must present both that code and the original verifier. Supabase creates a session only if the verifier matches the earlier challenge. Therefore, `signInWithOtp()` must remain browser-owned: moving it to a server client can leave the browser without the verifier required by `/api/auth/callback`.
+
 ```
 1. User enters email on /signin, clicks "Send Magic Link"
    │

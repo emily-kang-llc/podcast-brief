@@ -2,17 +2,20 @@
 
 import Link from "next/link";
 import { useState } from "react";
-import { createClient } from "@/libs/supabase/client";
 import toast from "react-hot-toast";
 import config from "@/config";
+import apiClient from "@/libs/api";
+import { useFCaptcha } from "@/libs/fcaptcha/useFCaptcha";
 
-// This a login/singup page for Supabase Auth.
-// Successfull login redirects to /api/auth/callback where the Code Exchange is processed (see app/api/auth/callback/route.js).
+// Login/signup page for Supabase Auth. The OTP send goes through our
+// /api/auth/signin proxy (which verifies FCaptcha) instead of the browser
+// calling Supabase directly. The magic-link click is processed by
+// /api/auth/callback where the code exchange happens.
 export default function Login() {
-  const supabase = createClient();
   const [email, setEmail] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isDisabled, setIsDisabled] = useState(false);
+  const { execute } = useFCaptcha();
 
   const handleSignup = async (e) => {
     e?.preventDefault();
@@ -20,21 +23,14 @@ export default function Login() {
     setIsLoading(true);
 
     try {
-      const redirectURL = window.location.origin + "/api/auth/callback";
+      const fcaptchaToken = await execute("signup");
+      const data = await apiClient.post("/auth/signin", { email, fcaptchaToken });
 
-      const { error } = await supabase.auth.signInWithOtp({
-        email,
-        options: {
-          emailRedirectTo: redirectURL,
-        },
-      });
-
-      // supabase-js returns errors (including network failures, as AuthRetryableFetchError)
-      // instead of throwing — the catch below never sees them. Toasting success without
-      // checking `error` hid a production SMTP outage behind "Check your emails!".
-      if (error) {
-        console.error(error);
-        if (error.code === "over_email_send_rate_limit") {
+      // The route returns 200 with { error } (supabase-js shape) so the
+      // apiClient interceptor doesn't double-toast. Handle it like Supabase did.
+      if (data.error) {
+        console.error(data.error);
+        if (data.error.code === "over_email_send_rate_limit") {
           toast.error("Too many attempts — wait a minute, then try again.");
         } else {
           toast.error("Couldn't send the sign-in link. Please try again.");
@@ -46,8 +42,14 @@ export default function Login() {
 
       setIsDisabled(true);
     } catch (error) {
+      // 4xx/5xx (captcha block, rate limit, server error) are already toasted
+      // by the apiClient interceptor; only network-level failures reach here.
       console.error(error);
-      toast.error("Couldn't send the sign-in link. Please try again.");
+      if (error.response) {
+        console.error("Response status:", error.response.status);
+      } else {
+        toast.error("Couldn't send the sign-in link. Please try again.");
+      }
     } finally {
       setIsLoading(false);
     }

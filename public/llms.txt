@@ -1,0 +1,17 @@
+# PodcastBrief
+
+> Structured, cited briefs from podcast episodes. Submit an Apple Podcasts episode URL; get back a brief with summary, ideas, insights, quotes, habits, claims, validated reference links, and recommendations. Asynchronous: typical turnaround 2–5 minutes.
+
+## For agents
+
+- OpenAPI: https://www.podcastbrief.app/api/v1/openapi.json
+- Auth: `Authorization: Bearer pb_live_…` (a human creates keys at POST /api/v1/keys while signed in)
+- Pricing: 1 credit per hour of audio, rounded up. Credits are prepaid by a human at https://www.podcastbrief.app/billing. Use `max_credits` on POST /api/v1/briefs to cap spend.
+- Flow: POST /api/v1/quotes (optional) → POST /api/v1/briefs → poll GET /api/v1/briefs/{id} until status=complete, or register a callback_url for a signed `brief.completed` webhook.
+- Outcomes: `succeeded`, `partial` (brief exists, a later step failed), `failed` (credits auto-refunded on first run). Errors carry stable codes.
+- Idempotency: send `Idempotency-Key` on POST /api/v1/briefs. Duplicate episode URLs return the existing brief (200, existing=true).
+- Inputs accepted today: Apple Podcasts episode links containing `?i=`. Episodes up to 4 hours.
+
+## Humans
+
+- App: https://www.podcastbrief.app/
