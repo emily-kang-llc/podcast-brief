@@ -1,20 +1,28 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useFCaptcha } from "@/libs/fcaptcha/useFCaptcha";
 import apiClient from "@/libs/api";
 import toast from "react-hot-toast";
 
 export default function BriefModal({ brief, onRegenerate, onClose }) {
   const [isRegenerating, setIsRegenerating] = useState(false);
-  const { enabled, ready, prepare, consume, invalidate } = useFCaptcha();
+  const { prepare, consume } = useFCaptcha();
+
+  // Pre-mint the regeneration token while the user reads the brief, so the
+  // regenerate click never waits on it.
+  useEffect(() => {
+    if (brief?.status === "complete") {
+      prepare("brief_regenerate").catch(() => {});
+    }
+  }, [brief?.status, prepare]);
 
   const handleRegenerate = async () => {
-    if (!brief || !enabled || !ready) return;
+    if (!brief) return;
     
     setIsRegenerating(true);
     
     try {
-      // Prepare the token for regeneration
-      const fcaptchaToken = await prepare("brief_regenerate");
+      // Single-use: consume the pre-minted regeneration token.
+      const fcaptchaToken = await consume("brief_regenerate");
       
       const data = await apiClient.post(`/jobs/brief/${brief.id}/regenerate`, {
         fcaptchaToken
@@ -83,7 +91,7 @@ export default function BriefModal({ brief, onRegenerate, onClose }) {
                   <button
                     className="btn btn-primary"
                     onClick={handleRegenerate}
-                    disabled={isRegenerating || !ready}
+                    disabled={isRegenerating}
                   >
                     {isRegenerating && <span className="loading loading-spinner loading-xs"></span>}
                     Regenerate Brief

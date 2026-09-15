@@ -1,22 +1,17 @@
 import { useState, useEffect } from "react";
-import Link from "next/link";
 import toast from "react-hot-toast";
-import config from "@/config";
 import apiClient from "@/libs/api";
 import { useFCaptcha } from "@/libs/fcaptcha/useFCaptcha";
-import { getRegenCost } from "@/libs/credits";
 
 export default function BriefRequestForm({ episodeUrl, onSubmit, onCancel }) {
   const [isLoading, setIsLoading] = useState(false);
   const [estimate, setEstimate] = useState(null);
   const [regenerating, setRegenerating] = useState(false);
-  const [regenCost, setRegenCost] = useState(null);
-  const { enabled, ready, prepare, consume, invalidate } = useFCaptcha();
+  const { prepare, consume } = useFCaptcha();
 
   // When the URL changes, reset state
   useEffect(() => {
     setEstimate(null);
-    setRegenCost(null);
   }, [episodeUrl]);
 
   const handleEstimate = async (e) => {
@@ -28,11 +23,9 @@ export default function BriefRequestForm({ episodeUrl, onSubmit, onCancel }) {
     try {
       const data = await apiClient.post("/jobs/brief/estimate", { episodeUrl });
       setEstimate(data);
-      
-      // Prepare the token for brief submission when validated
-      if (enabled && ready) {
-        await prepare("brief_submit");
-      }
+      // Pre-mint the submit token while the user reads the cost, so the
+      // final click never waits on it.
+      prepare("brief_submit").catch(() => {});
     } catch (error) {
       console.error("Estimate error:", error);
       toast.error("Failed to estimate episode: " + (error.message || "Unknown error"));
@@ -48,8 +41,8 @@ export default function BriefRequestForm({ episodeUrl, onSubmit, onCancel }) {
     setIsLoading(true);
     
     try {
-      // Get the FCaptcha token if available
-      const fcaptchaToken = enabled && ready ? await prepare("brief_submit") : null;
+      // Single-use: consume the pre-minted token (or mint on fallback).
+      const fcaptchaToken = await consume("brief_submit");
       
       const data = await apiClient.post("/jobs/brief", {
         episodeUrl,
@@ -83,8 +76,9 @@ export default function BriefRequestForm({ episodeUrl, onSubmit, onCancel }) {
     setRegenerating(true);
     
     try {
-      // Get the FCaptcha token for regeneration
-      const fcaptchaToken = enabled && ready ? await prepare("brief_regenerate") : null;
+      // Pre-mint the regeneration token as soon as regeneration becomes the
+      // predictable action, then consume it (single-use) on the write.
+      const fcaptchaToken = await consume("brief_regenerate");
       
       const data = await apiClient.post("/jobs/brief", {
         episodeUrl,
@@ -121,7 +115,6 @@ export default function BriefRequestForm({ episodeUrl, onSubmit, onCancel }) {
             onChange={(e) => {
               if (onCancel) onCancel();
               setEstimate(null);
-              setRegenCost(null);
               // Call callback with new URL
               if (onSubmit) onSubmit({ episodeUrl: e.target.value });
             }}
