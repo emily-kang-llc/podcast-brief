@@ -1,49 +1,29 @@
 import { useState } from "react";
-// import { useEffect } from "react";
-import toast from "react-hot-toast";
 import { useFCaptcha } from "@/libs/fcaptcha/useFCaptcha";
 import apiClient from "@/libs/api";
+import toast from "react-hot-toast";
 
-export default function BriefModal({
-  brief,
-  isOpen,
-  onClose,
-  onRegenerate,
-  onConfirm,
-}) {
+export default function BriefModal({ brief, onRegenerate, onClose }) {
   const [isRegenerating, setIsRegenerating] = useState(false);
-  const [showRegenerateConfirm, setShowRegenerateConfirm] = useState(false);
-  const { enabled, ready, execute } = useFCaptcha();
+  const { enabled, ready, prepare, consume, invalidate } = useFCaptcha();
 
-  const handleRegenerate = async (e) => {
-    e?.preventDefault();
-    if (!brief?.input_url) return;
-    
-    setShowRegenerateConfirm(true);
-  };
-
-  const confirmRegenerate = async () => {
-    if (!brief?.input_url) return;
+  const handleRegenerate = async () => {
+    if (!brief || !enabled || !ready) return;
     
     setIsRegenerating(true);
-    setShowRegenerateConfirm(false);
     
     try {
-      // Get the FCaptcha token for regeneration
-      const fcaptchaToken = enabled && ready ? await execute("brief_regenerate") : null;
+      // Prepare the token for regeneration
+      const fcaptchaToken = await prepare("brief_regenerate");
       
-      const data = await apiClient.post("/jobs/brief", {
-        episodeUrl: brief.input_url,
-        regenerate: true,
+      const data = await apiClient.post(`/jobs/brief/${brief.id}/regenerate`, {
         fcaptchaToken
       });
       
+      // Called on success
       if (onRegenerate) {
         onRegenerate(data);
       }
-      
-      toast.success("Brief regeneration queued");
-      onClose();
     } catch (error) {
       console.error("Regenerate error:", error);
       toast.error("Failed to regenerate brief: " + (error.message || "Unknown error"));
@@ -52,77 +32,62 @@ export default function BriefModal({
     }
   };
 
-  const handleConfirm = async (e) => {
-    e?.preventDefault();
-    if (!brief?.input_url) return;
-    
-    try {
-      // Get the FCaptcha token if available
-      const fcaptchaToken = enabled && ready ? await execute("brief_submit") : null;
-      
-      const data = await apiClient.post("/jobs/brief", {
-        episodeUrl: brief.input_url,
-        durationSeconds: brief.episode_duration_seconds,
-        sig: brief.sig,  // This would need to be passed from a fresh estimate
-        episodeTitle: brief.episode_title,
-        podcastName: brief.podcast_name,
-        fcaptchaToken
-      });
-      
-      if (onConfirm) {
-        onConfirm(data);
-      }
-      
-      toast.success("Brief queued");
-      onClose();
-    } catch (error) {
-      console.error("Submit error:", error);
-      toast.error("Failed to submit brief: " + (error.message || "Unknown error"));
-    }
-  };
-
   return (
-    <div className={`modal ${isOpen ? "modal-open" : ""}`}>
-      <div className="modal-box max-w-3xl">
-        <h3 className="font-bold text-lg">Brief Details</h3>
+    <div className="modal modal-open">
+      <div className="modal-box max-w-4xl max-h-[90vh] overflow-y-auto">
+        <h3 className="font-bold text-lg mb-4">Generated Brief</h3>
         
         {brief && (
-          <div className="py-4">
-            <p>
-              <strong>Episode:</strong> {brief.episode_title}
-            </p>
-            <p>
-              <strong>Podcast:</strong> {brief.podcast_name}
-            </p>
-            <p>
-              <strong>Status:</strong> {brief.status}
-            </p>
-            <p>
-              <strong>Duration:</strong> {Math.floor(brief.episode_duration_seconds / 60)}:{String(brief.episode_duration_seconds % 60).padStart(2, '0')}
-            </p>
-            <p>
-              <strong>Created:</strong> {new Date(brief.created_at).toLocaleString()}
-            </p>
+          <div>
+            <div className="flex justify-between items-start mb-4">
+              <div>
+                <h2 className="text-xl font-semibold">{brief.episodeTitle}</h2>
+                <p className="opacity-70">{brief.podcastName}</p>
+              </div>
+              
+              <div className="flex gap-2">
+                <button 
+                  className="btn btn-outline btn-sm"
+                  onClick={onClose}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
             
-            {brief.started_at && (
-              <p>
-                <strong>Started:</strong> {new Date(brief.started_at).toLocaleString()}
-              </p>
-            )}
-            
-            {brief.completed_at && (
-              <p>
-                <strong>Completed:</strong> {new Date(brief.completed_at).toLocaleString()}
-              </p>
-            )}
-            
-            {brief.output_markdown && (
-              <div className="mt-4">
-                <h4 className="font-bold">Brief Preview:</h4>
-                <div className="mockup-code bg-base-200 p-2 mt-1">
-                  <pre className="whitespace-pre-wrap">
-                    <code>{brief.output_markdown.substring(0, 300)}{brief.output_markdown.length > 300 ? '...' : ''}</code>
-                  </pre>
+            {brief.status !== "complete" ? (
+              <div>
+                <p className="text-center py-8">
+                  Brief is still being generated... 
+                </p>
+              </div>
+            ) : (
+              <div>
+                <div className="prose max-w-none">
+                  {brief.outputMarkdown && (
+                    <div 
+                      className="markdown-body"
+                      dangerouslySetInnerHTML={{ __html: brief.outputMarkdown }} 
+                    />
+                  )}
+                </div>
+                
+                <div className="mt-6 flex justify-end gap-2">
+                  <button
+                    className="btn btn-outline"
+                    onClick={onClose}
+                  >
+                    Close
+                  </button>
+                  
+                  <button
+                    className="btn btn-primary"
+                    onClick={handleRegenerate}
+                    disabled={isRegenerating || !ready}
+                  >
+                    {isRegenerating && <span className="loading loading-spinner loading-xs"></span>}
+                    Regenerate Brief
+                  </button>
                 </div>
               </div>
             )}
@@ -131,50 +96,8 @@ export default function BriefModal({
         
         <div className="modal-action">
           <button className="btn" onClick={onClose}>Close</button>
-          {brief?.status === "complete" && (
-            <button 
-              className="btn btn-secondary"
-              onClick={handleRegenerate}
-              disabled={isRegenerating}
-            >
-              {isRegenerating && <span className="loading loading-spinner loading-xs"></span>}
-              Regenerate
-            </button>
-          )}
-          {brief?.status !== "complete" && (
-            <button 
-              className="btn btn-primary"
-              onClick={handleConfirm}
-            >
-              Generate Brief
-            </button>
-          )}
         </div>
       </div>
-      
-      {/* Regeneration confirmation modal */}
-      {showRegenerateConfirm && (
-        <div className="modal modal-open">
-          <div className="modal-box">
-            <h3 className="font-bold text-lg">Confirm Regeneration</h3>
-            <p className="py-4">
-              This will regenerate the brief using the same episode URL. 
-              Are you sure you want to continue?
-            </p>
-            <div className="modal-action">
-              <button className="btn" onClick={() => setShowRegenerateConfirm(false)}>Cancel</button>
-              <button 
-                className="btn btn-error"
-                onClick={confirmRegenerate}
-                disabled={isRegenerating}
-              >
-                {isRegenerating && <span className="loading loading-spinner loading-xs"></span>}
-                Regenerate
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

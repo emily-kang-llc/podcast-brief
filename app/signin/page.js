@@ -1,21 +1,37 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import toast from "react-hot-toast";
 import config from "@/config";
-import apiClient from "@/libs/api";
 import { useFCaptcha } from "@/libs/fcaptcha/useFCaptcha";
+import { createBrowserAuthClient, createOtpProxyFetch } from "@/libs/auth/browser-otp-client";
 
 // Login/signup page for Supabase Auth. The OTP send goes through our
 // /api/auth/signin proxy (which verifies FCaptcha) instead of the browser
-// calling Supabase directly. The magic-link click is processed by
-// /api/auth/callback where the code exchange happens.
+// calling Supabase directly. The PKCE verifier is generated and stored by
+// Supabase JS in this browser; only the OTP HTTP request is rerouted.
+// The magic-link click is processed by /api/auth/callback, unchanged.
 export default function Login() {
   const [email, setEmail] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isDisabled, setIsDisabled] = useState(false);
-  const { execute } = useFCaptcha();
+  const { prepare, consume, enabled: fcaptchaEnabled } = useFCaptcha();
+  const debounceRef = useRef(null);
+
+  // Prepare the signup token in the background once the email looks valid, so
+  // the final click never waits on token minting.
+  useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    const valid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    if (!fcaptchaEnabled || !valid) return;
+    debounceRef.current = setTimeout(() => {
+      prepare("signup").catch(() => {});
+    }, 400);
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  }, [email, fcaptchaEnabled, prepare]);
 
   const handleSignup = async (e) => {
     e?.preventDefault();
@@ -23,14 +39,24 @@ export default function Login() {
     setIsLoading(true);
 
     try {
-      const fcaptchaToken = await execute("signup");
-      const data = await apiClient.post("/auth/signin", { email, fcaptchaToken });
+      // Consume the pre-minted token (single-use). Falls back to minting one
+      // if the background prepare did not finish.
+      const fcaptchaToken = await consume("signup");
 
-      // The route returns 200 with { error } (supabase-js shape) so the
-      // apiClient interceptor doesn't double-toast. Handle it like Supabase did.
-      if (data.error) {
-        console.error(data.error);
-        if (data.error.code === "over_email_send_rate_limit") {
+      // The auth client keeps PKCE in the browser; its OTP request is
+      // intercepted and sent through our FCaptcha-verifying proxy.
+      const authClient = createBrowserAuthClient(createOtpProxyFetch(fcaptchaToken));
+
+      const { error } = await authClient.auth.signInWithOtp({
+        email,
+        options: {
+          emailRedirectTo: new URL("/api/auth/callback", window.location.origin).toString(),
+        },
+      });
+
+      if (error) {
+        console.error(error);
+        if (error.code === "over_email_send_rate_limit") {
           toast.error("Too many attempts — wait a minute, then try again.");
         } else {
           toast.error("Couldn't send the sign-in link. Please try again.");
@@ -39,17 +65,10 @@ export default function Login() {
       }
 
       toast.success("Check your emails!");
-
       setIsDisabled(true);
     } catch (error) {
-      // 4xx/5xx (captcha block, rate limit, server error) are already toasted
-      // by the apiClient interceptor; only network-level failures reach here.
       console.error(error);
-      if (error.response) {
-        console.error("Response status:", error.response.status);
-      } else {
-        toast.error("Couldn't send the sign-in link. Please try again.");
-      }
+      toast.error("Couldn't send the sign-in link. Please try again.");
     } finally {
       setIsLoading(false);
     }

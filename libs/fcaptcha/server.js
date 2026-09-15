@@ -1,5 +1,6 @@
 import "server-only";
 import { NextResponse } from "next/server";
+import { cleanUrl } from "@/libs/url.mjs";
 
 // Server-side FCaptcha verification for human (cookie-session) writes.
 //
@@ -9,18 +10,22 @@ import { NextResponse } from "next/server";
 //              is set. Deploy in this mode first, confirm the frontend is
 //              sending tokens (no "would reject" lines in Vercel logs), then
 //              switch to enforce.
-//   enforce  — rejects missing/invalid tokens. Fails CLOSED if FCaptcha is
-//              unreachable unless FCAPTCHA_FAIL_OPEN=true.
+//   enforce  — rejects missing/invalid tokens.
+//
+// Outage policy is action-scoped, never a global switch:
+//   - brief_submit / brief_regenerate fail OPEN when FCaptcha is unreachable
+//     (captcha_unavailable) so an FCaptcha outage never blocks paying
+//     customers from creating briefs.
+//   - signup / api_key_create (and any other action) fail CLOSED on every
+//     failure, including captcha_unavailable (503).
+//   - Invalid, missing, reused, wrong-action, wrong-host, low-score, and
+//     misconfigured verdicts fail closed everywhere.
 //
 // API-key callers never go through this: the key is their credential.
 
-const FCAPTCHA_URL = (process.env.FCAPTCHA_URL || "").replace(/\/+$/, "");
-const VERIFY_SECRET = process.env.FCAPTCHA_VERIFY_SECRET || "";
-const MODE = (process.env.FCAPTCHA_MODE || (FCAPTCHA_URL ? "monitor" : "off")).toLowerCase();
-const FAIL_OPEN = /^(1|true|yes|on)$/i.test(process.env.FCAPTCHA_FAIL_OPEN || "");
-// Off by default: IP binding causes false rejections when the visitor's path to
-// Vercel and to FCaptcha differ (IPv4 vs IPv6, mobile carriers).
-const BIND_IP = /^(1|true|yes|on)$/i.test(process.env.FCAPTCHA_BIND_IP || "");
+// Human web-UI writes that may proceed when the verifier itself is down.
+const FAILOPEN_ACTIONS = new Set(["brief_submit", "brief_regenerate"]);
+
 const TIMEOUT_MS = 4000;
 
 const MESSAGES = {
@@ -32,8 +37,19 @@ const MESSAGES = {
   captcha_misconfigured: "Verification is misconfigured on the server.",
 };
 
+// Env is read per call (not at module load) so mode can vary by deployment
+// and tests can set it per case. cleanUrl throws on unset vars; FCaptcha being
+// unconfigured must mean "off", not a crash.
+function currentConfig() {
+  let url = "";
+  try { url = cleanUrl("FCAPTCHA_URL"); } catch { url = ""; }
+  const verifySecret = process.env.FCAPTCHA_VERIFY_SECRET || "";
+  const mode = (process.env.FCAPTCHA_MODE || (url ? "monitor" : "off")).toLowerCase();
+  return { url, verifySecret, mode };
+}
+
 export function fcaptchaMode() {
-  return MODE;
+  return currentConfig().mode;
 }
 
 // Token arrives as `fcaptchaToken` in the JSON body or as X-FCaptcha-Token.
@@ -58,24 +74,17 @@ function expectedHostnames(req) {
   return host ? [host] : [];
 }
 
-function visitorIp(req) {
-  const xff = req.headers.get("x-forwarded-for");
-  if (xff) return xff.split(",")[0].trim();
-  return req.headers.get("x-real-ip") || null;
-}
-
-async function siteverify(req, token, action) {
-  if (!FCAPTCHA_URL || !VERIFY_SECRET) return { pass: false, reason: "captcha_misconfigured" };
+async function siteverify(req, token, action, cfg) {
+  if (!cfg.url || !cfg.verifySecret) return { pass: false, reason: "captcha_misconfigured" };
   if (!token) return { pass: false, reason: "captcha_missing" };
 
-  const ip = BIND_IP ? visitorIp(req) : null;
   let res;
   let data;
   try {
-    res = await fetch(`${FCAPTCHA_URL}/turnstile/v0/siteverify`, {
+    res = await fetch(`${cfg.url}/turnstile/v0/siteverify`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ secret: VERIFY_SECRET, response: token, ...(ip ? { remoteip: ip } : {}) }),
+      body: JSON.stringify({ secret: cfg.verifySecret, response: token }),
       signal: AbortSignal.timeout(TIMEOUT_MS),
       cache: "no-store",
     });
@@ -86,7 +95,7 @@ async function siteverify(req, token, action) {
   }
 
   if (!res.ok) {
-    console.error(`[fcaptcha] siteverify HTTP ${res.status}:`, JSON.stringify(data));
+    console.error(`[fcaptcha] siteverify HTTP ${res.status}`);
     return { pass: false, reason: res.status === 401 ? "captcha_misconfigured" : "captcha_unavailable" };
   }
   if (!data.success) {
@@ -107,25 +116,27 @@ async function siteverify(req, token, action) {
   return { pass: true, reason: null, score: data.score, hostname, action: data.action };
 }
 
-// Returns { ok, mode, checked, reason?, score? }. `ok` already accounts for mode.
+// Returns { ok, mode, checked, reason?, score? }. `ok` already accounts for
+// mode and the action-scoped outage policy.
 export async function verifyHuman(req, { token, action }) {
-  if (MODE === "off") return { ok: true, mode: MODE, checked: false };
+  const cfg = currentConfig();
+  if (cfg.mode === "off") return { ok: true, mode: cfg.mode, checked: false };
 
-  const verdict = await siteverify(req, token, action);
+  const verdict = await siteverify(req, token, action, cfg);
 
-  if (MODE === "monitor") {
+  if (cfg.mode === "monitor") {
     if (!verdict.pass) {
       console.warn(`[fcaptcha] monitor: would reject action=${action} reason=${verdict.reason}`);
     }
-    return { ok: true, mode: MODE, checked: true, ...verdict };
+    return { ok: true, mode: cfg.mode, checked: true, ...verdict };
   }
 
-  if (verdict.pass) return { ok: true, mode: MODE, checked: true, ...verdict };
-  if (verdict.reason === "captcha_unavailable" && FAIL_OPEN) {
-    console.warn("[fcaptcha] enforce: FCaptcha unavailable, FCAPTCHA_FAIL_OPEN=true, allowing");
-    return { ok: true, mode: MODE, checked: true, ...verdict, failedOpen: true };
+  if (verdict.pass) return { ok: true, mode: cfg.mode, checked: true, ...verdict };
+  if (verdict.reason === "captcha_unavailable" && FAILOPEN_ACTIONS.has(action)) {
+    console.warn(`[fcaptcha] enforce: FCaptcha unavailable for action=${action}; failing open`);
+    return { ok: true, mode: cfg.mode, checked: true, ...verdict, failedOpen: true };
   }
-  return { ok: false, mode: MODE, checked: true, ...verdict };
+  return { ok: false, mode: cfg.mode, checked: true, ...verdict };
 }
 
 export function humanCheckResponse(result) {

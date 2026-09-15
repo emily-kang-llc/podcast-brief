@@ -35,22 +35,40 @@ export async function POST(req) {
       );
     }
 
-    const { email, fcaptchaToken } = await req.json();
-    if (!email) {
+    const body = await req.json();
+    if (!body.email) {
       return NextResponse.json({ error: "email required" }, { status: 400 });
     }
 
+    // Only allow the expected OTP fields that auth-js generates
+    const expectedFields = ["email", "options"];
+    const bodyKeys = Object.keys(body);
+    const invalidFields = bodyKeys.filter(key => !expectedFields.includes(key));
+    if (invalidFields.length > 0) {
+      console.warn("[auth/signin] Unexpected fields in OTP request:", invalidFields);
+      return NextResponse.json({ error: "Invalid request" }, { status: 400 });
+    }
+
+    // Extract token that arrives as X-FCaptcha-Token header
+    const fcaptchaToken = extractFCaptchaToken(req, body);
     const human = await verifyHuman(req, {
-      token: extractFCaptchaToken(req, { email, fcaptchaToken }),
+      token: fcaptchaToken,
       action: "signup",
     });
     if (!human.ok) return humanCheckResponse(human);
 
     const emailRedirectTo = new URL("/api/auth/callback", req.url).toString();
+    
+    // Use the server client to initiate the OTP (this preserves the PKCE cookie)
     const supabase = await createClient();
+    
+    // The browser client created in the page.js will have the PKCE verifiers in cookies
+    // We should forward the actual body that Supabase auth expects
     const { error } = await supabase.auth.signInWithOtp({
-      email,
-      options: { emailRedirectTo },
+      email: body.email,
+      options: {
+        emailRedirectTo,
+      },
     });
 
     // Deliberately 200 with { error } in the body — mirrors the supabase-js

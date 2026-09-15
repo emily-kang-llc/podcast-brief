@@ -11,7 +11,7 @@ export default function BriefRequestForm({ episodeUrl, onSubmit, onCancel }) {
   const [estimate, setEstimate] = useState(null);
   const [regenerating, setRegenerating] = useState(false);
   const [regenCost, setRegenCost] = useState(null);
-  const { enabled, ready, execute } = useFCaptcha();
+  const { enabled, ready, prepare, consume, invalidate } = useFCaptcha();
 
   // When the URL changes, reset state
   useEffect(() => {
@@ -31,7 +31,7 @@ export default function BriefRequestForm({ episodeUrl, onSubmit, onCancel }) {
       
       // Prepare the token for brief submission when validated
       if (enabled && ready) {
-        await execute("brief_submit");
+        await prepare("brief_submit");
       }
     } catch (error) {
       console.error("Estimate error:", error);
@@ -49,7 +49,7 @@ export default function BriefRequestForm({ episodeUrl, onSubmit, onCancel }) {
     
     try {
       // Get the FCaptcha token if available
-      const fcaptchaToken = enabled && ready ? await execute("brief_submit") : null;
+      const fcaptchaToken = enabled && ready ? await prepare("brief_submit") : null;
       
       const data = await apiClient.post("/jobs/brief", {
         episodeUrl,
@@ -84,7 +84,7 @@ export default function BriefRequestForm({ episodeUrl, onSubmit, onCancel }) {
     
     try {
       // Get the FCaptcha token for regeneration
-      const fcaptchaToken = enabled && ready ? await execute("brief_regenerate") : null;
+      const fcaptchaToken = enabled && ready ? await prepare("brief_regenerate") : null;
       
       const data = await apiClient.post("/jobs/brief", {
         episodeUrl,
