@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { resolveIdentity, identityErrorResponse, hasScope, scopeErrorResponse } from "@/libs/auth/identity";
 import { protectV1 } from "@/libs/arcjet/v1";
-import { jsonError, handleRouteError } from "@/libs/api/errors";
+import { jsonError, handleRouteError } from "@/libs/api/error";
 import { quoteEpisode, getBalance, billingUrl } from "@/libs/briefs/service";
 
 // POST /api/v1/quotes { episode_url } — price an episode without committing.

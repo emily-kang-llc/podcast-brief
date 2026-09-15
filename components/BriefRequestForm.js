@@ -1,143 +1,193 @@
-// Two-step brief request: estimate (duration + cost preview) → confirm (atomic credit deduction).
-"use client";
-
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import Link from "next/link";
+import toast from "react-hot-toast";
+import config from "@/config";
 import apiClient from "@/libs/api";
-import { formatDuration } from "@/libs/credits";
-import CreditPackModal from "@/components/CreditPackModal";
+import { useFCaptcha } from "@/libs/fcaptcha/useFCaptcha";
+import { getRegenCost } from "@/libs/credits";
 
+export default function BriefRequestForm({ episodeUrl, onSubmit, onCancel }) {
+  const [isLoading, setIsLoading] = useState(false);
+  const [estimate, setEstimate] = useState(null);
+  const [regenerating, setRegenerating] = useState(false);
+  const [regenCost, setRegenCost] = useState(null);
+  const { enabled, ready, execute } = useFCaptcha();
 
-export default function BriefRequestForm({ onSuccess }) {
-  const [url, setUrl] = useState("");
-  const [estimateResult, setEstimateResult] = useState(null);
-  const [estimateLoading, setEstimateLoading] = useState(false);
-  const [confirmLoading, setConfirmLoading] = useState(false);
-  const [inlineError, setInlineError] = useState(null);
-  const [inlineErrorCode, setInlineErrorCode] = useState(null);
-  const [showInsufficientModal, setShowInsufficientModal] = useState(false);
-  const [creditData, setCreditData] = useState(null);
+  // When the URL changes, reset state
+  useEffect(() => {
+    setEstimate(null);
+    setRegenCost(null);
+  }, [episodeUrl]);
 
-  async function handleEstimate() {
-    setEstimateLoading(true);
-    setInlineError(null);
-    setInlineErrorCode(null);
-    setEstimateResult(null);
-
+  const handleEstimate = async (e) => {
+    e?.preventDefault();
+    if (!episodeUrl) return;
+    
+    setIsLoading(true);
+    
     try {
-      const data = await apiClient.post("/jobs/brief/estimate", { episodeUrl: url });
-      setEstimateResult(data);
-    } catch (err) {
-      if (err.creditData) {
-        // 402 — insufficient credits
-        setCreditData(err.creditData);
-        setShowInsufficientModal(true);
-      } else if (err.response?.status === 422 || err.response?.status === 500) {
-        setInlineError(
-          err.response.data?.message || "Something went wrong. Please try again."
-        );
-        setInlineErrorCode(err.response.data?.error || null);
+      const data = await apiClient.post("/jobs/brief/estimate", { episodeUrl });
+      setEstimate(data);
+      
+      // Prepare the token for brief submission when validated
+      if (enabled && ready) {
+        await execute("brief_submit");
       }
-      // 401 handled by apiClient (redirect), other errors toasted by apiClient
+    } catch (error) {
+      console.error("Estimate error:", error);
+      toast.error("Failed to estimate episode: " + (error.message || "Unknown error"));
     } finally {
-      setEstimateLoading(false);
+      setIsLoading(false);
     }
-  }
+  };
 
-  async function handleConfirm() {
-    setConfirmLoading(true);
-
+  const handleSubmit = async (e) => {
+    e?.preventDefault();
+    if (!episodeUrl || !estimate) return;
+    
+    setIsLoading(true);
+    
     try {
-      await apiClient.post("/jobs/brief", {
-        episodeUrl: url,
-        durationSeconds: estimateResult.durationSeconds,
-        sig: estimateResult.sig,
-        episodeTitle: estimateResult.episodeTitle,
-        podcastName: estimateResult.podcastName,
+      // Get the FCaptcha token if available
+      const fcaptchaToken = enabled && ready ? await execute("brief_submit") : null;
+      
+      const data = await apiClient.post("/jobs/brief", {
+        episodeUrl,
+        durationSeconds: estimate.durationSeconds,
+        sig: estimate.sig,
+        episodeTitle: estimate.episodeTitle,
+        podcastName: estimate.podcastName,
+        fcaptchaToken
       });
-      setUrl("");
-      setEstimateResult(null);
-      if (onSuccess) onSuccess();
-    } catch (err) {
-      if (err.creditData) {
-        setCreditData(err.creditData);
-        setShowInsufficientModal(true);
+      
+      // Called on success
+      if (onSubmit) {
+        onSubmit(data);
       }
-      // 409/other errors toasted by apiClient
+    } catch (error) {
+      console.error("Submit error:", error);
+      if (error.response?.status === 402) {
+        toast.error("Insufficient credits");
+      } else {
+        toast.error("Failed to submit brief: " + (error.message || "Unknown error"));
+      }
     } finally {
-      setConfirmLoading(false);
+      setIsLoading(false);
     }
-  }
+  };
 
-  function handleReset() {
-    setEstimateResult(null);
-    setInlineError(null);
-    setInlineErrorCode(null);
-  }
-
+  const handleRegenerate = async (e) => {
+    e?.preventDefault();
+    if (!episodeUrl) return;
+    
+    setRegenerating(true);
+    
+    try {
+      // Get the FCaptcha token for regeneration
+      const fcaptchaToken = enabled && ready ? await execute("brief_regenerate") : null;
+      
+      const data = await apiClient.post("/jobs/brief", {
+        episodeUrl,
+        regenerate: true,
+        fcaptchaToken
+      });
+      
+      // Called on success
+      if (onSubmit) {
+        onSubmit(data);
+      }
+    } catch (error) {
+      console.error("Regenerate error:", error);
+      toast.error("Failed to regenerate brief: " + (error.message || "Unknown error"));
+    } finally {
+      setRegenerating(false);
+    }
+  };
 
   return (
-    <>
-      <form onSubmit={(e) => { e.preventDefault(); estimateResult ? handleConfirm() : handleEstimate(); }} className="space-y-4">
-        <input
-          type="url"
-          value={url}
-          onChange={(e) => { setUrl(e.target.value); if (estimateResult) handleReset(); }}
-          placeholder="https://podcasts.apple.com/..."
-          className="input input-bordered w-full"
-          disabled={confirmLoading}
-        />
-
-        {inlineError && (
-          <div className="text-error text-sm space-y-2">
-            <p>{inlineError}</p>
-            {inlineErrorCode === "episode_too_long" && (
-              <a
-                href={`mailto:emily@podcastbrief.app?subject=${encodeURIComponent("Interest in longer episode support")}&body=${encodeURIComponent("Hi, I'm interested in getting briefs for episodes longer than 4 hours.\n\nFor example:\n- (Insert podcasts here, optional)")}`}
-                className="btn btn-sm btn-outline"
-              >
-                Let us know you want longer episodes
-              </a>
-            )}
+    <div className="card bg-base-100 shadow-xl">
+      <div className="card-body">
+        <h2 className="card-title">Submit Podcast Episode</h2>
+        
+        <div className="form-control w-full max-w-xs">
+          <label className="label">
+            <span className="label-text">Apple Podcasts URL</span>
+          </label>
+          <input
+            type="text"
+            placeholder="Enter Apple Podcasts URL"
+            className="input input-bordered w-full max-w-xs"
+            value={episodeUrl || ""}
+            onChange={(e) => {
+              if (onCancel) onCancel();
+              setEstimate(null);
+              setRegenCost(null);
+              // Call callback with new URL
+              if (onSubmit) onSubmit({ episodeUrl: e.target.value });
+            }}
+          />
+        </div>
+        
+        <div className="flex flex-row gap-2 mt-2">
+          <button
+            className="btn btn-primary"
+            onClick={handleEstimate}
+            disabled={isLoading || !episodeUrl}
+          >
+            {isLoading && <span className="loading loading-spinner loading-xs"></span>}
+            Estimate
+          </button>
+          
+          {estimate && (
+            <button
+              className="btn btn-secondary"
+              onClick={handleSubmit}
+              disabled={isLoading}
+            >
+              {isLoading && <span className="loading loading-spinner loading-xs"></span>}
+              Generate Brief
+            </button>
+          )}
+          
+          {estimate && (
+            <button
+              className="btn btn-accent"
+              onClick={handleRegenerate}
+              disabled={regenerating}
+            >
+              {regenerating && <span className="loading loading-spinner loading-xs"></span>}
+              Regenerate
+            </button>
+          )}
+        </div>
+        
+        {estimate && (
+          <div className="mt-4">
+            <p>
+              <strong>Episode:</strong> {estimate.episodeTitle}
+            </p>
+            <p>
+              <strong>Podcast:</strong> {estimate.podcastName}
+            </p>
+            <p>
+              <strong>Duration:</strong> {Math.floor(estimate.durationSeconds / 60)}:{String(estimate.durationSeconds % 60).padStart(2, '0')}
+            </p>
+            <p>
+              <strong>Estimated Credits:</strong> {estimate.creditsNeeded}
+            </p>
+            <p>
+              <strong>Credits Remaining:</strong> {estimate.creditsRemaining}
+            </p>
           </div>
         )}
-
-        {estimateResult && (
-          <div className="bg-base-200 rounded-lg p-4 space-y-1">
-            <p className="font-semibold">{estimateResult.episodeTitle}</p>
-            <p className="text-sm text-base-content/60">
-              {formatDuration(estimateResult.durationSeconds)} &middot; {estimateResult.creditsNeeded} credit{estimateResult.creditsNeeded === 1 ? "" : "s"}
-            </p>
-            <p className="text-sm text-base-content/60">
-              You will have {estimateResult.creditsRemaining - estimateResult.creditsNeeded} credit{estimateResult.creditsRemaining - estimateResult.creditsNeeded === 1 ? "" : "s"} remaining
-            </p>
-          </div>
-        )}
-
-        {estimateResult ? (
-          <button
-            type="submit"
-            className="btn btn-primary btn-block"
-            disabled={confirmLoading}
-          >
-            {confirmLoading ? "Generating..." : `Generate Brief (${estimateResult.creditsNeeded} credit${estimateResult.creditsNeeded === 1 ? "" : "s"})`}
-          </button>
-        ) : (
-          <button
-            type="submit"
-            className="btn btn-primary btn-block"
-            disabled={estimateLoading || !url.trim()}
-          >
-            {estimateLoading ? "Checking..." : "Check Episode"}
-          </button>
-        )}
-      </form>
-
-      <CreditPackModal
-        isOpen={showInsufficientModal}
-        onClose={() => setShowInsufficientModal(false)}
-        title="Not enough credits"
-        subtitle={creditData?.message}
-      />
-    </>
+        
+        <div className="mt-4">
+          <p className="text-sm opacity-70">
+            Briefs are generated using AI and may contain inaccuracies. 
+            The process typically takes 1-3 minutes.
+          </p>
+        </div>
+      </div>
+    </div>
   );
 }

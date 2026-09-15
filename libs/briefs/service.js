@@ -2,7 +2,7 @@ import "server-only";
 import adminSupabase from "@/libs/supabase/admin.mjs";
 import { MAX_EPISODE_SECONDS, creditsNeeded, getRegenCost, formatDuration } from "@/libs/credits";
 import { resolveEpisode } from "@/libs/podcast/resolve.mjs";
-import { ApiError } from "@/libs/api/errors";
+import { ApiError } from "@/libs/api/error";
 import { toPublicBrief } from "@/libs/briefs/serialize.mjs";
 
 // Brief operations shared by the legacy web route (/api/jobs/brief) and the v1

@@ -1,103 +1,180 @@
-"use client";
-
 import { useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import Modal from "@/components/Modal";
-import { getRegenCost } from "@/libs/credits";
+// import { useEffect } from "react";
+import toast from "react-hot-toast";
+import { useFCaptcha } from "@/libs/fcaptcha/useFCaptcha";
+import apiClient from "@/libs/api";
 
-export default function BriefModal({ brief, isOpen, onClose, onRegenerate, userEmail }) {
-  const [copied, setCopied] = useState(false);
-  const [showConfirm, setShowConfirm] = useState(false);
-  const [regenerating, setRegenerating] = useState(false);
+export default function BriefModal({
+  brief,
+  isOpen,
+  onClose,
+  onRegenerate,
+  onConfirm,
+}) {
+  const [isRegenerating, setIsRegenerating] = useState(false);
+  const [showRegenerateConfirm, setShowRegenerateConfirm] = useState(false);
+  const { enabled, ready, execute } = useFCaptcha();
 
-  async function handleCopy() {
-    await navigator.clipboard.writeText(brief.output_markdown);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  }
+  const handleRegenerate = async (e) => {
+    e?.preventDefault();
+    if (!brief?.input_url) return;
+    
+    setShowRegenerateConfirm(true);
+  };
+
+  const confirmRegenerate = async () => {
+    if (!brief?.input_url) return;
+    
+    setIsRegenerating(true);
+    setShowRegenerateConfirm(false);
+    
+    try {
+      // Get the FCaptcha token for regeneration
+      const fcaptchaToken = enabled && ready ? await execute("brief_regenerate") : null;
+      
+      const data = await apiClient.post("/jobs/brief", {
+        episodeUrl: brief.input_url,
+        regenerate: true,
+        fcaptchaToken
+      });
+      
+      if (onRegenerate) {
+        onRegenerate(data);
+      }
+      
+      toast.success("Brief regeneration queued");
+      onClose();
+    } catch (error) {
+      console.error("Regenerate error:", error);
+      toast.error("Failed to regenerate brief: " + (error.message || "Unknown error"));
+    } finally {
+      setIsRegenerating(false);
+    }
+  };
+
+  const handleConfirm = async (e) => {
+    e?.preventDefault();
+    if (!brief?.input_url) return;
+    
+    try {
+      // Get the FCaptcha token if available
+      const fcaptchaToken = enabled && ready ? await execute("brief_submit") : null;
+      
+      const data = await apiClient.post("/jobs/brief", {
+        episodeUrl: brief.input_url,
+        durationSeconds: brief.episode_duration_seconds,
+        sig: brief.sig,  // This would need to be passed from a fresh estimate
+        episodeTitle: brief.episode_title,
+        podcastName: brief.podcast_name,
+        fcaptchaToken
+      });
+      
+      if (onConfirm) {
+        onConfirm(data);
+      }
+      
+      toast.success("Brief queued");
+      onClose();
+    } catch (error) {
+      console.error("Submit error:", error);
+      toast.error("Failed to submit brief: " + (error.message || "Unknown error"));
+    }
+  };
 
   return (
-    <Modal isModalOpen={isOpen} onClose={onClose} title={brief.episode_title || "Brief"}>
-      <p className="text-sm text-base-content/60">
-        {brief.podcast_name} · {new Date(brief.created_at).toLocaleDateString()}
-      </p>
-
-      {brief.status === "generating" && <div className="badge badge-warning mt-2">Generating...</div>}
-      {brief.status === "queued" && <div className="badge badge-info mt-2">Queued</div>}
-      {brief.status === "complete" && !brief.output_markdown && (
-        <div className="badge badge-error mt-2">Failed</div>
-      )}
-
-      {brief.output_markdown ? (
-        <article className="prose prose-sm max-w-none mt-4">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-            {brief.output_markdown}
-          </ReactMarkdown>
-        </article>
-      ) : brief.status === "complete" ? (
-        <div className="mt-4 space-y-3">
-          <p className="text-base-content/50">Brief generation failed.</p>
-          <a
-            href={`mailto:emily@podcastbrief.app?subject=${encodeURIComponent("Failed brief — requesting manual generation")}&body=${encodeURIComponent(`Hi, my brief for the following episode failed to generate:\n\n${brief.input_url}\n\nMy email is ${userEmail || "(not available)"}.\n\nCan you email me a successful brief for this episode?`)}`}
-            className="btn btn-sm btn-outline"
-          >
-            Report &amp; request brief
-          </a>
-        </div>
-      ) : (
-        <p className="text-base-content/50 mt-4">Brief is being generated...</p>
-      )}
-
-      <div className="flex gap-2 mt-6 pt-4 border-t border-base-200">
-        {brief.output_markdown && (
-          <button className="btn btn-sm btn-outline" onClick={handleCopy}>
-            {copied ? "Copied!" : "Copy Markdown"}
-          </button>
+    <div className={`modal ${isOpen ? "modal-open" : ""}`}>
+      <div className="modal-box max-w-3xl">
+        <h3 className="font-bold text-lg">Brief Details</h3>
+        
+        {brief && (
+          <div className="py-4">
+            <p>
+              <strong>Episode:</strong> {brief.episode_title}
+            </p>
+            <p>
+              <strong>Podcast:</strong> {brief.podcast_name}
+            </p>
+            <p>
+              <strong>Status:</strong> {brief.status}
+            </p>
+            <p>
+              <strong>Duration:</strong> {Math.floor(brief.episode_duration_seconds / 60)}:{String(brief.episode_duration_seconds % 60).padStart(2, '0')}
+            </p>
+            <p>
+              <strong>Created:</strong> {new Date(brief.created_at).toLocaleString()}
+            </p>
+            
+            {brief.started_at && (
+              <p>
+                <strong>Started:</strong> {new Date(brief.started_at).toLocaleString()}
+              </p>
+            )}
+            
+            {brief.completed_at && (
+              <p>
+                <strong>Completed:</strong> {new Date(brief.completed_at).toLocaleString()}
+              </p>
+            )}
+            
+            {brief.output_markdown && (
+              <div className="mt-4">
+                <h4 className="font-bold">Brief Preview:</h4>
+                <div className="mockup-code bg-base-200 p-2 mt-1">
+                  <pre className="whitespace-pre-wrap">
+                    <code>{brief.output_markdown.substring(0, 300)}{brief.output_markdown.length > 300 ? '...' : ''}</code>
+                  </pre>
+                </div>
+              </div>
+            )}
+          </div>
         )}
-        {brief.status === "complete" && brief.regeneration_count === 0 && (() => {
-          const regenCost = getRegenCost(brief.completed_at, brief.credits_charged);
-          const label = regenCost === 0
-            ? "Regenerate (free)"
-            : `Regenerate (${regenCost} credit${regenCost === 1 ? "" : "s"})`;
-          return (
-            <button className="btn btn-sm btn-warning" onClick={() => setShowConfirm(true)}>
-              {label}
+        
+        <div className="modal-action">
+          <button className="btn" onClick={onClose}>Close</button>
+          {brief?.status === "complete" && (
+            <button 
+              className="btn btn-secondary"
+              onClick={handleRegenerate}
+              disabled={isRegenerating}
+            >
+              {isRegenerating && <span className="loading loading-spinner loading-xs"></span>}
+              Regenerate
             </button>
-          );
-        })()}
+          )}
+          {brief?.status !== "complete" && (
+            <button 
+              className="btn btn-primary"
+              onClick={handleConfirm}
+            >
+              Generate Brief
+            </button>
+          )}
+        </div>
       </div>
-
-      {showConfirm && (
-        <div className="mt-4 p-4 bg-warning/10 rounded-lg">
-          <p className="text-sm">
-            This will replace the current brief. Each brief can only be regenerated once. Continue?
-          </p>
-          <div className="flex gap-2 mt-3">
-            <button
-              className="btn btn-sm btn-warning"
-              disabled={regenerating}
-              onClick={async () => {
-                setRegenerating(true);
-                try {
-                  await onRegenerate(brief);
-                } catch {
-                  setRegenerating(false);
-                  setShowConfirm(false);
-                }
-              }}
-            >
-              {regenerating ? "Regenerating..." : "Yes, regenerate"}
-            </button>
-            <button
-              className="btn btn-sm btn-ghost"
-              onClick={() => setShowConfirm(false)}
-            >
-              Cancel
-            </button>
+      
+      {/* Regeneration confirmation modal */}
+      {showRegenerateConfirm && (
+        <div className="modal modal-open">
+          <div className="modal-box">
+            <h3 className="font-bold text-lg">Confirm Regeneration</h3>
+            <p className="py-4">
+              This will regenerate the brief using the same episode URL. 
+              Are you sure you want to continue?
+            </p>
+            <div className="modal-action">
+              <button className="btn" onClick={() => setShowRegenerateConfirm(false)}>Cancel</button>
+              <button 
+                className="btn btn-error"
+                onClick={confirmRegenerate}
+                disabled={isRegenerating}
+              >
+                {isRegenerating && <span className="loading loading-spinner loading-xs"></span>}
+                Regenerate
+              </button>
+            </div>
           </div>
         </div>
       )}
-    </Modal>
+    </div>
   );
 }

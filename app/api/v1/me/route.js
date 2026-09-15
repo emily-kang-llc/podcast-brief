@@ -1,39 +1,39 @@
 import { NextResponse } from "next/server";
-import { resolveIdentity, identityErrorResponse } from "@/libs/auth/identity";
+import { createClient } from "@/libs/supabase/server";
 import { protectV1 } from "@/libs/arcjet/v1";
-import { handleRouteError } from "@/libs/api/errors";
-import { getBalance, monthlyCreditsUsedByKey, billingUrl } from "@/libs/briefs/service";
 
-// GET /api/v1/me — who am I and what can I spend.
+// Get user identity information (api v1)
 export async function GET(req) {
   try {
-    const identity = await resolveIdentity(req);
-    if (identity.error) return identityErrorResponse(identity);
+    const authSupabase = await createClient();
+    const { data: { user }, error } = await authSupabase.auth.getUser();
+    if (error || !user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
 
-    const limited = await protectV1(req, { callerId: identity.callerId, kind: "read" });
-    if (limited) return limited;
+    // Arcjet shield + per-caller rate limit, no bot detection
+    const denied = await protectV1(req, { callerId: user.id, kind: "read" });
+    if (denied) return denied;
 
-    const credits = await getBalance(identity.profileId);
-    const apiKey = identity.kind === "api_key"
-      ? {
-          id: identity.apiKey.id,
-          name: identity.apiKey.name,
-          scopes: identity.apiKey.scopes,
-          monthly_credit_cap: identity.apiKey.monthlyCreditCap,
-          credits_used_this_month: await monthlyCreditsUsedByKey(identity.apiKey.id),
-          callback_url: identity.apiKey.callbackUrl,
-        }
-      : null;
+    // Fetch user's credits and profile info
+    const { data: creditsData, error: creditsError } = await authSupabase
+      .from("profiles")
+      .select("credits")
+      .eq("id", user.id)
+      .single();
+      
+    if (creditsError) {
+      console.error("Error fetching user credits:", creditsError);
+      return NextResponse.json({ error: "Failed to fetch user data" }, { status: 500 });
+    }
 
     return NextResponse.json({
-      object: "account",
-      profile_id: identity.profileId,
-      auth: identity.kind,
-      credits_remaining: credits,
-      top_up_url: billingUrl(),
-      api_key: apiKey,
+      user_id: user.id,
+      scopes: ["briefs:read", "briefs:write"],  // Session has both scopes
+      credits_remaining: creditsData.credits,
     });
-  } catch (err) {
-    return handleRouteError(err, "GET /api/v1/me");
+  } catch (e) {
+    console.error("Unhandled error in /api/v1/me:", e);
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
 }

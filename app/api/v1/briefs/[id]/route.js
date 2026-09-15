@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/libs/supabase/server";
+import { getBriefForProfile } from "@/libs/briefs/service";
 import { protectV1 } from "@/libs/arcjet/v1";
 
-// List API keys (session-only, human access)
-export async function GET(req) {
+// Get one owned brief by ID (agent read access)
+export async function GET(req, { params }) {
   try {
     const authSupabase = await createClient();
     const { data: { user }, error } = await authSupabase.auth.getUser();
@@ -15,21 +16,20 @@ export async function GET(req) {
     const denied = await protectV1(req, { callerId: user.id, kind: "read" });
     if (denied) return denied;
 
-    // Fetch user's API keys (excluding the secret hash)
-    const { data, error: fetchError } = await authSupabase
-      .from("api_keys")
-      .select("id,created_at,revoked_at,description")
-      .eq("profile_id", user.id)
-      .order("created_at", { ascending: false });
-      
-    if (fetchError) {
-      console.error("Error fetching API keys:", fetchError);
-      return NextResponse.json({ error: "Failed to fetch API keys" }, { status: 500 });
+    const { id } = params;
+    if (!id) {
+      return NextResponse.json({ error: "Brief ID required" }, { status: 400 });
     }
 
-    return NextResponse.json(data);
+    const brief = await getBriefForProfile(user.id, id);
+    
+    if (!brief) {
+      return NextResponse.json({ error: "Brief not found" }, { status: 404 });
+    }
+
+    return NextResponse.json(brief);
   } catch (e) {
-    console.error("Unhandled error in /api/v1/keys:", e);
+    console.error("Unhandled error in /api/v1/briefs/[id]:", e);
     return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
 }

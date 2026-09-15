@@ -3,7 +3,7 @@ import { createClient } from "@/libs/supabase/server";
 import { MAX_EPISODE_SECONDS, creditsNeeded as calcCredits } from "@/libs/credits";
 import { verifyEstimate } from "@/libs/estimate-signer";
 import { getPostHog } from "@/libs/posthog/server";
-import { ApiError } from "@/libs/api/errors";
+import { ApiError } from "@/libs/api/error";
 import { queueBrief, regenerateBrief } from "@/libs/briefs/service";
 import { verifyHuman, extractFCaptchaToken, humanCheckResponse } from "@/libs/fcaptcha/server";
 import arcjet, { shield, tokenBucket, detectBot } from "@arcjet/next";
