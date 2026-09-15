@@ -1,53 +1,65 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/libs/supabase/server";
-import { queueBrief } from "@/libs/briefs/service";
+import { queueBrief, quoteEpisode, getBalance, billingUrl } from "@/libs/briefs/service";
 import { protectV1 } from "@/libs/arcjet/v1";
 import { ApiError } from "@/libs/api/error";
+import { resolveIdentity } from "@/libs/auth/identity";
 
 // Create a brief (agent write access)
 export async function POST(req) {
   try {
-    const authSupabase = await createClient();
-    const { data: { user }, error } = await authSupabase.auth.getUser();
-    if (error || !user) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    // Task 7: Use proper bearer identity resolution
+    const identity = await resolveIdentity(req);
+    if (identity.error) {
+      return NextResponse.json({ error: identity.error.code, message: identity.error.message }, { status: identity.error.status });
+    }
+
+    // Check that this identity has write scope
+    if (identity.kind === "api_key") {
+      // Check that this API key has the required 'briefs:write' scope  
+      const hasWriteScope = identity.apiKey.scopes.includes("briefs:write");
+      if (!hasWriteScope) {
+        return NextResponse.json({
+          error: "insufficient_scope",
+          message: "This API key lacks the briefs:write scope"
+        }, { status: 403 });
+      }
     }
 
     const body = await req.json();
     const { episodeUrl } = body;
 
-    // In agent API, the route only accepts Bearer tokens
     if (!episodeUrl) {
       return NextResponse.json({ error: "Episode URL required" }, { status: 400 });
     }
 
     // Arcjet shield + per-caller rate limit, no bot detection
-    const denied = await protectV1(req, { callerId: user.id, kind: "write" });
+    const denied = await protectV1(req, { callerId: identity.callerId, kind: "write" });
     if (denied) return denied;
 
-    // Validate episode URL and get the episode info
-    const episode = await validateEpisodeUrl(episodeUrl);
-    if (!episode) {
-      return NextResponse.json({ error: "Invalid episode URL" }, { status: 422 });
+    // Task 8: Handle episode quoting and cost resolution using shared service function
+    let episode, creditsNeeded;
+    try {
+      ({ episode, creditsNeeded } = await quoteEpisode(episodeUrl));
+    } catch (err) {
+      if (err instanceof ApiError) {
+        return NextResponse.json({ error: err.code, message: err.message }, { status: err.status });
+      }
+      throw err;
     }
 
-    // Get user's credits
-    const { data: creditsData, error: creditsError } = await authSupabase
-      .from("profiles")
-      .select("credits")
-      .eq("id", user.id)
-      .single();
+    // For API key requests, we already have profileId from the key
+    const profileId = identity.profileId;
+
+    // Check user's balance
+    const balance = await getBalance(profileId);
       
-    if (!creditsData || creditsError) {
-      console.error("Error fetching user credits:", creditsError);
-      return NextResponse.json({ error: "Internal server error" }, { status: 500 });
-    }
-
     // Check for URL deduplication
+    const authSupabase = await createClient();
     const { data: existingBrieftData, error: existingBrieftError } = await authSupabase
       .from("briefs")
       .select("id,status")
-      .eq("profile_id", user.id)
+      .eq("profile_id", profileId)
       .eq("input_url", episodeUrl)
       .eq("environment", process.env.APP_ENV)
       .single();
@@ -68,7 +80,7 @@ export async function POST(req) {
     const { data: completedBriefData, error: completedBriefError } = await authSupabase
       .from("briefs")
       .select("id")
-      .eq("profile_id", user.id)
+      .eq("profile_id", profileId)
       .eq("input_url", episodeUrl)
       .eq("environment", process.env.APP_ENV)
       .eq("status", "complete")
@@ -81,17 +93,26 @@ export async function POST(req) {
       }, { status: 409 });
     }
 
-    // Check user credits
-    const maxCredits = await getMaxCredits(user.id);
-    
-    // Queue the brief (bypass FCaptcha for agent v1)
+    // Task 8: Use the shared principle of using credits from the balance
+    // Check if user has enough credits for this episode
+    if (creditsNeeded > balance) {
+      return NextResponse.json({
+        error: "insufficient_credits",
+        credits_needed: creditsNeeded,
+        credits_remaining: balance,
+        top_up_url: billingUrl()
+      }, { status: 402 });
+    }
+
+    // Task 8: Queue the brief with proper credentials (from API key or user)
     const queued = await queueBrief({
-      profileId: user.id,
+      profileId: profileId,
       episodeUrl,
       durationSeconds: episode.durationSeconds,
-      creditsToCharge: episode.credits,
+      creditsToCharge: creditsNeeded, 
       episodeTitle: episode.title,
       podcastName: episode.podcastName,
+      apiKeyId: identity.kind === "api_key" ? identity.apiKey.id : null
     });
 
     const location = `${process.env.NEXT_PUBLIC_DOMAIN_NAME}/api/v1/briefs/${queued.briefId}`;
@@ -112,22 +133,4 @@ export async function POST(req) {
     console.error("Unhandled error in /api/v1/briefs:", e);
     return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
-}
-
-// Simple URL validation and metadata extraction logic
-async function validateEpisodeUrl(url) {
-  // This would be replaced with actual implementation in a real system
-  // For now, returning a mock implementation for the file structure
-  return {
-    title: "Sample Episode",
-    podcastName: "Sample Podcast",
-    durationSeconds: 1800,
-    credits: 1
-  };
-}
-
-// Get user's maximum allowed credits
-async function getMaxCredits(profileId) {
-  // For now, return a placeholder 
-  return 100;
 }

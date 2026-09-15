@@ -1,39 +1,30 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/libs/supabase/server";
+import { resolveIdentity, identityErrorResponse } from "@/libs/auth/identity";
+import { getBalance } from "@/libs/briefs/service";
 import { protectV1 } from "@/libs/arcjet/v1";
 
-// Get user identity information (api v1)
+// Identity/scopes/balance for the current caller. Works with either a cookie
+// session or a Bearer API key; agents use this to check their key works and
+// how many credits remain before submitting a brief.
 export async function GET(req) {
   try {
-    const authSupabase = await createClient();
-    const { data: { user }, error } = await authSupabase.auth.getUser();
-    if (error || !user) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
+    const identity = await resolveIdentity(req);
+    if (identity.error) return identityErrorResponse(identity);
 
     // Arcjet shield + per-caller rate limit, no bot detection
-    const denied = await protectV1(req, { callerId: user.id, kind: "read" });
+    const denied = await protectV1(req, { callerId: identity.callerId, kind: "read" });
     if (denied) return denied;
 
-    // Fetch user's credits and profile info
-    const { data: creditsData, error: creditsError } = await authSupabase
-      .from("profiles")
-      .select("credits")
-      .eq("id", user.id)
-      .single();
-      
-    if (creditsError) {
-      console.error("Error fetching user credits:", creditsError);
-      return NextResponse.json({ error: "Failed to fetch user data" }, { status: 500 });
-    }
+    const credits_remaining = await getBalance(identity.profileId);
 
     return NextResponse.json({
-      user_id: user.id,
-      scopes: ["briefs:read", "briefs:write"],  // Session has both scopes
-      credits_remaining: creditsData.credits,
+      identity_type: identity.kind === "api_key" ? "api_key" : "session",
+      scopes: identity.kind === "api_key" ? identity.apiKey.scopes : ["briefs:read", "briefs:write"],
+      credits_remaining,
     });
   } catch (e) {
-    console.error("Unhandled error in /api/v1/me:", e);
+    console.error("Unhandled error in /api/v1/me:", e.message);
     return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
 }
