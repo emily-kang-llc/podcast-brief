@@ -4,13 +4,17 @@
 
 ## For agents
 
-- OpenAPI: https://www.podcastbrief.app/api/v1/openapi.json
-- Auth: `Authorization: Bearer pb_live_…` (a human creates keys at POST /api/v1/keys while signed in)
-- Pricing: 1 credit per hour of audio, rounded up. Credits are prepaid by a human at https://www.podcastbrief.app/billing. Use `max_credits` on POST /api/v1/briefs to cap spend.
-- Flow: POST /api/v1/quotes (optional) → POST /api/v1/briefs → poll GET /api/v1/briefs/{id} until status=complete, or register a callback_url for a signed `brief.completed` webhook.
-- Outcomes: `succeeded`, `partial` (brief exists, a later step failed), `failed` (credits auto-refunded on first run). Errors carry stable codes.
-- Idempotency: send `Idempotency-Key` on POST /api/v1/briefs. Duplicate episode URLs return the existing brief (200, existing=true).
+- OpenAPI: https://www.podcastbrief.app/openapi.json
+- Auth: `Authorization: Bearer <pb_live_...>` (a human creates keys at POST /api/v1/keys while signed in; keys are environment-scoped and revocable)
+- Pricing: 1 credit per hour of audio, rounded up. Credits are prepaid by a human at https://www.podcastbrief.app/billing.
+- Flow: POST /api/v1/briefs once → receive 202 with `Location` and `Retry-After` → poll GET /api/v1/briefs/{id} until `status=complete`. Do not re-POST while a brief is in flight.
+- 409 `brief_already_queued`: an episode with the same URL is already queued or generating for this account. Do not POST again — keep polling the returned `status_url`.
+- 409 `brief_already_exists`: a completed brief for this episode already exists; the response carries its `brief_id`.
+- 402 `insufficient_credits`: the account is out of credits. The human owner must top up manually at the returned `top_up_url`; there is no automatic purchase. Stop retrying and tell the human.
+- 429: slow down; respect `Retry-After`.
+- Brief lifecycle: `queued` → `generating` → `complete`. A complete brief carries `output_markdown`; failures are reported through the brief's status without internal error details.
 - Inputs accepted today: Apple Podcasts episode links containing `?i=`. Episodes up to 4 hours.
+- No CAPTCHA or browser challenge is required on `/api/v1` — your API key and prepaid credits are the credential. Abuse is controlled by per-key rate limits.
 
 ## Humans
 

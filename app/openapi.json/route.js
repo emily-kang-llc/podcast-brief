@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 
 // Machine-readable description of the v1 API for agents and SDK generators.
 // Kept in code (not a static file) so it can reflect the deployed domain.
+// v0 scope: create + poll + identity + human key management. No webhooks,
+// callbacks, refunds, quotes, idempotency keys, or list pagination.
 
 function spec() {
   const domain = process.env.NEXT_PUBLIC_DOMAIN_NAME || "www.podcastbrief.app";
@@ -14,7 +16,7 @@ function spec() {
       title: "PodcastBrief API",
       version: "1.0.0",
       description:
-        "Turn an Apple Podcasts episode into a structured, cited brief. Briefs are asynchronous: create one, then poll GET /briefs/{id} or receive a signed webhook. Pricing: 1 credit per hour of audio, rounded up. Credits are prepaid by a human at " +
+        "Turn an Apple Podcasts episode into a structured, cited brief. Briefs are asynchronous: POST once, then poll GET /briefs/{id} per the Retry-After header until status=complete. Pricing: 1 credit per hour of audio, rounded up. Credits are prepaid by a human at " +
         `https://${domain}/billing.`,
     },
     servers: [{ url: `https://${domain}/api` }],
@@ -24,13 +26,13 @@ function spec() {
         apiKey: {
           type: "http",
           scheme: "bearer",
-          description: "API key created at POST /v1/keys (by a signed-in human). Format: pb_live_<48 hex>.",
+          description: "API key created at POST /v1/keys (by a signed-in human). Format: pb_live_<48 hex>. Keys are environment-scoped and revocable.",
         },
       },
       schemas: {
         Error: {
           type: "object",
-          required: ["error", "message"],
+          required: ["error"],
           properties: {
             error: { type: "string", description: "Stable machine-readable code" },
             message: { type: "string" },
@@ -41,61 +43,14 @@ function spec() {
           type: "object",
           properties: {
             id: { type: "string", format: "uuid" },
-            object: { type: "string", const: "brief" },
             status: { type: "string", enum: ["queued", "generating", "complete"] },
-            outcome: {
+            episode_title: { type: ["string", "null"] },
+            podcast_name: { type: ["string", "null"] },
+            output_markdown: {
               type: ["string", "null"],
-              enum: ["succeeded", "partial", "failed", null],
-              description: "null until status is complete. partial = brief exists but a later step failed.",
+              description: "Brief content when status=complete; null otherwise. No internal error details are exposed.",
             },
-            error: {
-              type: ["object", "null"],
-              properties: {
-                code: {
-                  type: "string",
-                  enum: ["episode_not_found", "audio_unreachable", "transcription_failed", "generation_failed", "reference_enrichment_failed", "internal_error"],
-                },
-                message: { type: "string" },
-              },
-            },
-            episode: {
-              type: "object",
-              properties: {
-                url: { type: "string" },
-                title: { type: ["string", "null"] },
-                podcast: { type: ["string", "null"] },
-                duration_seconds: { type: ["integer", "null"] },
-              },
-            },
-            credits: {
-              type: "object",
-              properties: { charged: { type: ["integer", "null"] }, refunded: { type: "integer" } },
-            },
-            regeneration_count: { type: "integer" },
-            queue_position: { type: ["integer", "null"], description: "1-based, only while queued" },
             created_at: { type: "string", format: "date-time" },
-            started_at: { type: ["string", "null"], format: "date-time" },
-            completed_at: { type: ["string", "null"], format: "date-time" },
-            has_output: { type: "boolean" },
-            output: {
-              type: ["object", "null"],
-              description: "Omitted from list responses; null until content exists.",
-              properties: {
-                markdown: { type: "string" },
-                sections: {
-                  type: "object",
-                  additionalProperties: {
-                    type: "object",
-                    properties: {
-                      heading: { type: "string" },
-                      text: { type: "string" },
-                      items: { type: "array", items: { type: "string" } },
-                    },
-                  },
-                },
-                references: { type: "array", items: { type: "object" } },
-              },
-            },
           },
         },
       },
@@ -103,24 +58,24 @@ function spec() {
     paths: {
       "/v1/me": {
         get: {
-          summary: "Account and credit balance",
-          responses: { 200: { description: "OK" }, 401: { description: "Unauthorized", content: { "application/json": { schema: error } } } },
-        },
-      },
-      "/v1/quotes": {
-        post: {
-          summary: "Price an episode without creating a brief",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: { type: "object", required: ["episode_url"], properties: { episode_url: { type: "string", format: "uri" } } },
+          summary: "Identity, scopes, and credit balance",
+          responses: {
+            200: {
+              description: "OK",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      identity_type: { type: "string", enum: ["api_key", "session"] },
+                      scopes: { type: "array", items: { type: "string", enum: ["briefs:read", "briefs:write"] } },
+                      credits_remaining: { type: "integer" },
+                    },
+                  },
+                },
               },
             },
-          },
-          responses: {
-            200: { description: "Quote with credits_needed, credits_remaining, sufficient" },
-            422: { description: "invalid_episode_url | episode_not_found | duration_unknown | episode_too_long", content: { "application/json": { schema: error } } },
+            401: { description: "Unauthorized", content: { "application/json": { schema: error } } },
           },
         },
       },
@@ -128,78 +83,110 @@ function spec() {
         post: {
           summary: "Create a brief (asynchronous)",
           description:
-            "Resolves the episode, charges credits atomically, and queues processing. Duplicate episode_url for the same account returns the existing brief with 200 and existing=true. Send Idempotency-Key to make retries safe.",
-          parameters: [{ name: "Idempotency-Key", in: "header", required: false, schema: { type: "string", maxLength: 128 } }],
+            "Resolves the episode, charges credits atomically, and queues processing. Retrying the same episode URL while it is queued or generating returns 409 brief_already_queued — keep polling the returned status_url instead of re-POSTing. A completed episode returns 409 brief_already_exists with its brief_id.",
           requestBody: {
             required: true,
             content: {
               "application/json": {
                 schema: {
                   type: "object",
-                  required: ["episode_url"],
+                  required: ["episodeUrl"],
                   properties: {
-                    episode_url: { type: "string", format: "uri", description: "Apple Podcasts episode link containing ?i=" },
-                    max_credits: { type: "integer", minimum: 0, description: "Refuse (402) if the episode would cost more than this" },
-                    callback_url: { type: "string", format: "uri", description: "HTTPS webhook for brief.completed; overrides the key's default" },
-                    regenerate: { type: "boolean", description: "Re-run a completed brief (free within 24h, otherwise full price; once per brief)" },
+                    episodeUrl: { type: "string", format: "uri", description: "Apple Podcasts episode link containing ?i=" },
                   },
                 },
               },
             },
           },
           responses: {
-            202: { description: "Queued", content: { "application/json": { schema: brief } } },
-            200: { description: "Already exists (existing=true)", content: { "application/json": { schema: brief } } },
-            402: { description: "insufficient_credits | max_credits_exceeded | api_key_cap_exceeded. Body includes top_up_url where applicable.", content: { "application/json": { schema: error } } },
-            409: { description: "brief_in_progress | already_regenerated", content: { "application/json": { schema: error } } },
+            202: {
+              description: "Accepted and durably queued",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      brief_id: { type: "string", format: "uuid" },
+                      status: { type: "string", const: "queued" },
+                      credits_charged: { type: "integer" },
+                      credits_remaining: { type: "integer" },
+                    },
+                  },
+                },
+              },
+              headers: {
+                Location: { schema: { type: "string" }, description: "Poll this URL for brief status" },
+                "Retry-After": { schema: { type: "string" }, description: "Recommended seconds before the next poll" },
+              },
+            },
+            400: { description: "Malformed request", content: { "application/json": { schema: error } } },
+            401: { description: "Invalid or revoked API key", content: { "application/json": { schema: error } } },
+            402: {
+              description: "insufficient_credits — the human owner must top up manually at top_up_url; no automatic purchase",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      error: { type: "string", const: "insufficient_credits" },
+                      credits_needed: { type: "integer" },
+                      credits_remaining: { type: "integer" },
+                      top_up_url: { type: "string", format: "uri" },
+                    },
+                  },
+                },
+              },
+            },
+            403: { description: "insufficient_scope", content: { "application/json": { schema: error } } },
+            409: {
+              description: "brief_already_queued (in-flight duplicate; poll status_url) | brief_already_exists (completed duplicate)",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      error: { type: "string", enum: ["brief_already_queued", "brief_already_exists"] },
+                      brief_id: { type: "string", format: "uuid" },
+                      status: { type: "string" },
+                      status_url: { type: "string" },
+                    },
+                  },
+                },
+              },
+            },
             422: { description: "Episode could not be used", content: { "application/json": { schema: error } } },
-            429: { description: "rate_limited" },
+            429: { description: "rate_limited; respect Retry-After" },
           },
-        },
-        get: {
-          summary: "List briefs (summaries, newest first)",
-          parameters: [
-            { name: "limit", in: "query", schema: { type: "integer", minimum: 1, maximum: 100, default: 20 } },
-            { name: "status", in: "query", schema: { type: "string", enum: ["queued", "generating", "complete"] } },
-            { name: "cursor", in: "query", schema: { type: "string" }, description: "next_cursor from the previous page" },
-          ],
-          responses: { 200: { description: "OK" } },
         },
       },
       "/v1/briefs/{id}": {
         get: {
-          summary: "Get a brief with full content",
+          summary: "Poll one owned brief",
           parameters: [{ name: "id", in: "path", required: true, schema: { type: "string", format: "uuid" } }],
           responses: {
             200: { description: "OK", content: { "application/json": { schema: brief } } },
-            404: { description: "not_found", content: { "application/json": { schema: error } } },
+            401: { description: "Unauthorized", content: { "application/json": { schema: error } } },
+            404: { description: "not_found (or not owned by this key)", content: { "application/json": { schema: error } } },
           },
         },
       },
       "/v1/keys": {
-        post: { summary: "Create an API key (signed-in humans only)", responses: { 201: { description: "Key returned once" } } },
-        get: { summary: "List API keys (signed-in humans only)", responses: { 200: { description: "OK" } } },
+        get: { summary: "List API keys, non-secret metadata only (signed-in humans only)", responses: { 200: { description: "OK" }, 401: { description: "Unauthorized" } } },
+        post: {
+          summary: "Create an API key (signed-in humans only; protected by an invisible human check)",
+          responses: {
+            200: { description: "Created; raw key returned exactly once" },
+            401: { description: "Unauthorized" },
+            403: { description: "Human verification failed" },
+            503: { description: "Human verification unavailable; try again shortly" },
+          },
+        },
       },
       "/v1/keys/{id}": {
         delete: {
-          summary: "Revoke an API key (signed-in humans only)",
+          summary: "Revoke an API key (signed-in humans only; idempotent)",
           parameters: [{ name: "id", in: "path", required: true, schema: { type: "string", format: "uuid" } }],
-          responses: { 200: { description: "Revoked" } },
-        },
-      },
-    },
-    "x-webhooks": {
-      "brief.completed": {
-        description:
-          "POST to callback_url when a brief reaches status=complete. Headers: X-PodcastBrief-Event, X-PodcastBrief-Brief-Id, X-PodcastBrief-Signature (t=<unix>,v1=<hex hmac-sha256(callback_secret, `${t}.${rawBody}`)>). Retried every 5 minutes for up to 8 attempts until a 2xx.",
-        payload: {
-          type: "object",
-          properties: {
-            id: { type: "string" },
-            type: { type: "string", const: "brief.completed" },
-            created_at: { type: "string", format: "date-time" },
-            data: brief,
-          },
+          responses: { 200: { description: "Revoked" }, 401: { description: "Unauthorized" } },
         },
       },
     },

@@ -40,6 +40,36 @@ User checks dashboard / /billing for credit history
 - No shared secrets between Vercel and Railway
 - Supabase API requests are unlimited and free on all plans
 
+### FCaptcha placements
+
+Invisible FCaptcha (self-hosted) guards the three server-controlled human abuse boundaries:
+
+1. **Signup OTP send** — the browser's Supabase client keeps PKCE verifier generation/storage; only its `/auth/v1/otp` HTTP request (carrying `code_challenge`) is rerouted through `POST /api/auth/signin`, which verifies the `signup` token before forwarding to a fixed Supabase endpoint with the public anon key. Server-side `signInWithOtp()` is forbidden.
+2. **Brief submit/regeneration (web UI)** — tokens are pre-minted in the background (after estimate success / when the modal opens) and consumed single-use on the write. The legacy `/api/jobs/brief` route verifies `brief_submit`/`brief_regenerate` before any credit or queue mutation.
+3. **API-key creation** — `POST /api/v1/keys` verifies `api_key_create` before insert (session-only; revoke does not require FCaptcha).
+
+Outage policy is action-scoped (no global switch):
+
+- `brief_submit` and `brief_regenerate` fail OPEN only on `captcha_unavailable`, so an FCaptcha outage never blocks brief customers.
+- `signup` and `api_key_create` fail CLOSED on `captcha_unavailable` (503).
+- Missing, invalid, reused, wrong-action, wrong-host, low-score, and misconfigured verdicts fail closed everywhere.
+- `/api/v1` never invokes FCaptcha: agents authenticate with scoped API keys, prepaid credits, and per-key Arcjet rate limits.
+
+Rollout: `FCAPTCHA_MODE=off|monitor|enforce`. Start in `monitor` (log, don't block); switch to `enforce` only after staging verifies token coverage and latency.
+
+### API-key model
+
+API keys are the agent credential for `/api/v1`. Format: `pb_live_<48 hex>` (env-scoped prefixes: `pb_live_`/`pb_test_`/`pb_dev_`). Stored in `api_keys` as SHA-256 `key_hash` + display `key_prefix` only — the raw key is returned exactly once at creation and never persisted, logged, or re-shown. Keys are scoped to `profile_id` and `environment`; revoked keys fail with 401. Creation is a signed-in-human action (FCaptcha-gated); API keys cannot mint API keys.
+
+### v0 agent routes
+
+- `POST /api/v1/briefs` — create a brief (asynchronous; bearer or session, never FCaptcha)
+- `GET /api/v1/briefs/{id}` — poll one owned brief (safe fields, no `error_log`)
+- `GET /api/v1/me` — identity type, scopes, credit balance
+- `GET/POST /api/v1/keys`, `DELETE /api/v1/keys/{id}` — session-only human key management
+
+`POST /api/v1/briefs` returns `202` with `Location` + `Retry-After` after the brief is durably queued; `409 brief_already_queued` (same episode in flight — poll the returned `status_url`; no second charge), `409 brief_already_exists` (completed duplicate), and `402 insufficient_credits` with `credits_needed`/`credits_remaining`/`top_up_url` for manual top-up. No idempotency keys in v0: profile + episode URL + environment dedup is the retry guard.
+
 ## Authentication Flow (Magic Link)
 
 Uses Supabase Auth with email OTP (magic links) + PKCE for secure code exchange.
